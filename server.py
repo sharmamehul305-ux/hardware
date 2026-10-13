@@ -84,7 +84,7 @@ def create_app(fleet: Fleet) -> FastAPI:
         return await invoke(fleet.arm, request.drone)
 
     @app.post("/api/takeoff")
-    async def takeoff(request: TakeoffRequest) -> dict[str, str]:
+    async def takeoff(request: TakeoffRequest) -> dict[str, Any]:
         return await invoke(fleet.takeoff, request.drone, request.altitude_m)
 
     @app.post("/api/goto")

@@ -9,7 +9,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import yaml
 
@@ -24,6 +24,20 @@ from safety import (
 )
 
 LOGGER = logging.getLogger(__name__)
+TELEMETRY_FIELDS = [
+    "timestamp",
+    "name",
+    "connected",
+    "latitude_deg",
+    "longitude_deg",
+    "altitude_m",
+    "speed_m_s",
+    "battery_percent",
+    "flight_mode",
+    "gps_healthy",
+    "is_armable",
+    "last_update",
+]
 
 
 class Fleet:
@@ -97,19 +111,7 @@ class Fleet:
             with self._telemetry_csv.open("w", newline="", encoding="utf-8") as output:
                 writer = csv.DictWriter(
                     output,
-                    fieldnames=[
-                        "timestamp",
-                        "name",
-                        "connected",
-                        "latitude_deg",
-                        "longitude_deg",
-                        "altitude_m",
-                        "speed_m_s",
-                        "battery_percent",
-                        "flight_mode",
-                        "gps_healthy",
-                        "is_armable",
-                    ],
+                    fieldnames=TELEMETRY_FIELDS,
                 )
                 writer.writeheader()
         if not self._commands_csv.exists():
@@ -128,13 +130,15 @@ class Fleet:
                     subscriber.put_nowait(payload)
                 except asyncio.QueueEmpty:
                     pass
-        row = state.to_dict()
-        row["timestamp"] = datetime.now(timezone.utc).isoformat()
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **state.to_dict(),
+        }
         try:
             with self._telemetry_csv.open("a", newline="", encoding="utf-8") as output:
-                writer = csv.DictWriter(output, fieldnames=row.keys())
+                writer = csv.DictWriter(output, fieldnames=TELEMETRY_FIELDS)
                 writer.writerow(row)
-        except OSError:
+        except (OSError, csv.Error, ValueError):
             LOGGER.exception("Unable to append telemetry CSV")
 
     def snapshot(self) -> dict[str, Any]:
@@ -174,6 +178,28 @@ class Fleet:
             raise RuntimeError("No drones are configured")
         return selected
 
+    def _separation_warnings(
+        self, destinations: dict[str, GeoPoint]
+    ) -> list[str]:
+        warnings = separation_warnings(destinations, self.limits.min_separation_m)
+        for name, target in destinations.items():
+            for other_name, state in self.telemetry.items():
+                if other_name in destinations:
+                    continue
+                other_position = state.position()
+                if other_position is not None:
+                    warnings.extend(
+                        validate_separation(
+                            target,
+                            [(other_name, other_position)],
+                            self.limits.min_separation_m,
+                            name,
+                        )
+                    )
+        for warning in warnings:
+            LOGGER.warning("Separation warning: %s", warning)
+        return warnings
+
     def _log_command(self, command: str, names: list[str], details: Any, result: str) -> None:
         try:
             with self._commands_csv.open("a", newline="", encoding="utf-8") as output:
@@ -194,7 +220,7 @@ class Fleet:
         self,
         command: str,
         drones: list[DroneController],
-        operation: Any,
+        operation: Callable[[DroneController], Awaitable[None]],
         details: Any = None,
     ) -> dict[str, str]:
         names = [drone.name for drone in drones]
@@ -216,23 +242,42 @@ class Fleet:
     async def arm(self, name: str | None = None) -> dict[str, str]:
         return await self._run_command("arm", self._selected(name), lambda d: d.arm())
 
-    async def takeoff(self, name: str | None = None, altitude_m: float = 10.0) -> dict[str, str]:
+    async def takeoff(
+        self, name: str | None = None, altitude_m: float = 10.0
+    ) -> dict[str, Any]:
         selected = self._selected(name)
         targets = [
             altitude_m + index * float(self.config.get("takeoff_stagger_m", 3.0))
             for index in range(len(selected))
         ]
-        for altitude in targets:
-            validate_target(GeoPoint(self.home.latitude_deg, self.home.longitude_deg, altitude), self.home, self.limits)
-        return await self._run_command(
+        destinations: dict[str, GeoPoint] = {}
+        for index, drone in enumerate(selected):
+            current = self.telemetry.get(drone.name)
+            current_position = current.position() if current is not None else None
+            latitude = (
+                current_position.latitude_deg
+                if current_position is not None
+                else self.home.latitude_deg
+            )
+            longitude = (
+                current_position.longitude_deg
+                if current_position is not None
+                else self.home.longitude_deg
+            )
+            target = GeoPoint(latitude, longitude, targets[index])
+            validate_target(target, self.home, self.limits)
+            destinations[drone.name] = target
+        warnings = self._separation_warnings(destinations)
+        altitude_by_name = {
+            drone.name: targets[index] for index, drone in enumerate(selected)
+        }
+        status = await self._run_command(
             "takeoff",
             selected,
-            lambda drone: drone.takeoff(
-                altitude_m
-                + selected.index(drone) * float(self.config.get("takeoff_stagger_m", 3.0))
-            ),
+            lambda drone: drone.takeoff(altitude_by_name[drone.name]),
             {"base_altitude_m": altitude_m, "stagger_m": self.config.get("takeoff_stagger_m", 3.0)},
         )
+        return {"results": status, "warnings": warnings}
 
     async def goto(
         self, latitude_deg: float, longitude_deg: float, altitude_m: float, name: str | None = None
@@ -241,26 +286,7 @@ class Fleet:
         target = GeoPoint(latitude_deg, longitude_deg, altitude_m)
         validate_target(target, self.home, self.limits)
         destinations = {drone.name: target for drone in selected}
-        warnings = separation_warnings(destinations, self.limits.min_separation_m)
-        for drone in selected:
-            peers = [
-                (other.name, state.position())
-                for other in self.drones.values()
-                if other.name != drone.name
-                and other.name not in destinations
-                and (state := self.telemetry.get(other.name)) is not None
-                and state.position() is not None
-            ]
-            warnings.extend(
-                validate_separation(
-                    target,
-                    [(peer, position) for peer, position in peers if position is not None],
-                    self.limits.min_separation_m,
-                    drone.name,
-                )
-            )
-        for warning in warnings:
-            LOGGER.warning("Separation warning: %s", warning)
+        warnings = self._separation_warnings(destinations)
         status = await self._run_command(
             "goto",
             selected,
@@ -296,22 +322,7 @@ class Fleet:
         destinations = dict(zip((drone.name for drone in selected), points))
         for target in points:
             validate_target(target, self.home, self.limits)
-        warnings = []
-        for drone_name, target in destinations.items():
-            warnings.extend(
-                validate_separation(
-                    target,
-                    [
-                        (other, point)
-                        for other, point in destinations.items()
-                        if other != drone_name
-                    ],
-                    self.limits.min_separation_m,
-                    drone_name,
-                )
-            )
-        for warning in warnings:
-            LOGGER.warning("Separation warning: %s", warning)
+        warnings = self._separation_warnings(destinations)
         status = await self._run_command(
             f"formation:{formation}",
             selected,
