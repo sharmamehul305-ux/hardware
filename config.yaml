@@ -1,0 +1,29 @@
+# PX4 SITL UDP ports; each drone also gets a separate local MAVSDK gRPC port.
+autopilot: PX4
+home:
+  latitude_deg: 47.397742
+  longitude_deg: 8.545594
+  altitude_m: 0
+
+takeoff_stagger_m: 3
+
+safety:
+  max_radius_m: 200
+  max_altitude_m: 50
+  min_separation_m: 5
+  low_battery_percent: 25
+  link_loss_seconds: 5
+
+logging:
+  directory: logs
+
+drones:
+  - name: drone-1
+    system_address: "udp://:14540"
+    grpc_port: 50051
+    # Set this explicitly before launching with --real.
+    real_system_address: null
+  - name: drone-2
+    system_address: "udp://:14541"
+    grpc_port: 50052
+    real_system_address: null

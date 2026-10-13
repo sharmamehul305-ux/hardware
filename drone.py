@@ -6,8 +6,9 @@ import asyncio
 import logging
 import math
 import time
+from collections.abc import AsyncIterable
 from dataclasses import asdict, dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from mavsdk import System
 
@@ -68,20 +69,24 @@ class DroneController:
 
     async def connect(self, timeout_s: float = 20.0) -> bool:
         """Connect and wait for the MAVLink link; return False on timeout/failure."""
+        if self.connected:
+            return True
+        deadline = asyncio.get_running_loop().time() + timeout_s
         try:
             await asyncio.wait_for(
                 self.system.connect(system_address=self.system_address), timeout_s
             )
-            await asyncio.wait_for(self._wait_connected(), timeout_s)
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            await asyncio.wait_for(self._wait_connected(), remaining)
             self.connected = True
             self.state.connected = True
             self._start_telemetry()
             self.telemetry_callback(self.state)
             LOGGER.info("%s connected on %s", self.name, self.system_address)
             return True
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            if isinstance(asyncio.current_task(), asyncio.Task) and asyncio.current_task().cancelled():
-                raise
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
             LOGGER.error("%s connection timed out after %.1f seconds", self.name, timeout_s)
         except Exception:
             LOGGER.exception("%s connection failed", self.name)
@@ -111,10 +116,10 @@ class DroneController:
         self._tasks.append(asyncio.create_task(self._publish_telemetry()))
 
     async def _consume_stream(
-        self, name: str, stream: Awaitable[Any], setter: Callable[[Any], None]
+        self, name: str, stream: AsyncIterable[Any], setter: Callable[[Any], None]
     ) -> None:
         try:
-            async for value in stream:  # type: ignore[attr-defined]
+            async for value in stream:
                 setter(value)
                 self.state.last_update = time.time()
         except asyncio.CancelledError:
@@ -153,27 +158,40 @@ class DroneController:
 
     async def _watch_connection(self) -> None:
         lost_since: float | None = None
+        iterator = self.system.core.connection_state().__aiter__()
+        pending: asyncio.Task[Any] | None = asyncio.create_task(anext(iterator))
         try:
-            async for state in self.system.core.connection_state():
-                if state.is_connected:
-                    lost_since = None
-                    self.state.connected = True
-                    self.connected = True
-                else:
-                    self.state.connected = False
-                    self.connected = False
-                    if lost_since is None:
-                        lost_since = time.monotonic()
-                    elif time.monotonic() - lost_since >= self.limits.link_loss_seconds:
-                        await self._failsafe("connection lost", land=True)
-                        return
-                await asyncio.sleep(0.2)
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=0.2)
+                if pending in done:
+                    state = pending.result()
+                    if state.is_connected:
+                        lost_since = None
+                        self.state.connected = True
+                        self.connected = True
+                    else:
+                        self.state.connected = False
+                        self.connected = False
+                        if lost_since is None:
+                            lost_since = time.monotonic()
+                    pending = asyncio.create_task(anext(iterator))
+                if (
+                    lost_since is not None
+                    and time.monotonic() - lost_since >= self.limits.link_loss_seconds
+                ):
+                    await self._failsafe("connection lost", land=True)
+                    return
         except asyncio.CancelledError:
             raise
         except Exception:
             LOGGER.exception("%s connection monitor failed", self.name)
             self.state.connected = False
             self.connected = False
+            await asyncio.sleep(self.limits.link_loss_seconds)
+            await self._failsafe("connection monitor stopped", land=True)
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     async def _failsafe(self, reason: str, land: bool) -> None:
         async with self._failsafe_lock:
